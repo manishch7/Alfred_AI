@@ -4,7 +4,7 @@ import os
 import re
 from typing import Any
 
-import anthropic
+import openai
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -14,13 +14,18 @@ from app.scenarios import SCENARIOS
 from app.signals import compute_signals
 
 # ---------------------------------------------------------------------------
-# Anthropic client – instantiated once at module load; reads ANTHROPIC_API_KEY.
+# xAI / Grok client – OpenAI-compatible, reads XAI_API_KEY.
 # ---------------------------------------------------------------------------
 
-_client = anthropic.Anthropic()
+_client = openai.OpenAI(
+    api_key=os.getenv("GROQ_API_KEY"),
+    base_url="https://api.groq.com/openai/v1",
+)
+
+_MODEL = "qwen/qwen3-32b"
 
 # ---------------------------------------------------------------------------
-# Static system message (always identical → gets cached by the API).
+# Static system message.
 # ---------------------------------------------------------------------------
 
 _SYSTEM_MESSAGE = (
@@ -31,9 +36,7 @@ _SYSTEM_MESSAGE = (
 )
 
 # ---------------------------------------------------------------------------
-# CORS – always allow local dev origins; add FRONTEND_URL in production.
-# Not setting FRONTEND_URL means the deployed frontend won't be able to reach
-# the API — fail loudly in prod rather than silently allow everything.
+# CORS
 # ---------------------------------------------------------------------------
 
 _ALLOWED_ORIGINS = [
@@ -81,20 +84,13 @@ class DecideRequest(BaseModel):
 
 
 class DecideResponse(BaseModel):
-    # Mirror of the request inputs for full traceability.
     inputs: dict[str, Any]
-    # Output of compute_signals – deterministic, no LLM involved.
     computed_signals: dict[str, Any]
-    # The exact prompt string sent to the model.
     prompt_sent: str
-    # Raw text returned by the model before parsing.
     raw_model_output: str
-    # Fields parsed from the model's JSON response.
     parsed_decision: str
     rationale: str
     confidence: float
-    # Set on degraded responses so the frontend can display failure state.
-    # None on happy-path responses.
     failure_mode: str | None = None
 
 
@@ -103,8 +99,9 @@ class DecideResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 def _extract_json(text: str) -> dict:
-    """Parse the model response as JSON, with a fallback regex extraction."""
-    text = text.strip()
+    """Parse the model response as JSON, stripping DeepSeek <think> blocks first."""
+    # DeepSeek R1 emits <think>...</think> before the actual answer — strip it.
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
     try:
         return json.loads(text)
     except json.JSONDecodeError:
@@ -185,10 +182,9 @@ def scenarios() -> list[dict]:
 
 @app.post("/decide", response_model=DecideResponse)
 async def decide(request: DecideRequest) -> DecideResponse:
-    """Full decision pipeline: signals → prompt → Claude → parsed JSON."""
+    """Full decision pipeline: signals → prompt → Grok → parsed JSON."""
 
     # Failure mode 3 – missing critical context.
-    # action must be non-empty; conversation_history must have at least one turn.
     if not request.action.strip() or not request.conversation_history:
         return _failure_response(
             request,
@@ -199,9 +195,6 @@ async def decide(request: DecideRequest) -> DecideResponse:
 
     # Step 1 – deterministic signal computation (no LLM).
     # Step 2 – build the structured prompt string.
-    # Both are pure Python and should never throw on valid inputs, but an
-    # unexpected error here must still produce a structured response rather
-    # than a raw FastAPI 500 with no detail.
     try:
         signals: dict[str, Any] = compute_signals(
             request.action, request.conversation_history, request.context
@@ -210,30 +203,22 @@ async def decide(request: DecideRequest) -> DecideResponse:
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Signal computation error: {exc}")
 
-    # Step 3 – call the Anthropic API.
-    # The sync client is run in a thread so it doesn't block the event loop,
-    # wrapped in wait_for to enforce a 10-second hard deadline.
+    # Step 3 – call the xAI / Grok API (OpenAI-compatible).
     try:
-        message = await asyncio.wait_for(
+        response = await asyncio.wait_for(
             asyncio.to_thread(
-                _client.messages.create,
-                model="claude-sonnet-4-6",
+                _client.chat.completions.create,
+                model=_MODEL,
                 max_tokens=512,
-                system=[
-                    {
-                        "type": "text",
-                        "text": _SYSTEM_MESSAGE,
-                        # Cache this static block: after the first request the system
-                        # message is served from cache at ~10 % of standard input cost.
-                        "cache_control": {"type": "ephemeral"},
-                    }
+                messages=[
+                    {"role": "system", "content": _SYSTEM_MESSAGE},
+                    {"role": "user", "content": prompt},
                 ],
-                messages=[{"role": "user", "content": prompt}],
             ),
-            timeout=10.0,
+            timeout=30.0,
         )
     except asyncio.TimeoutError:
-        # Failure mode 1 – LLM did not respond within 10 seconds.
+        # Failure mode 1 – LLM did not respond within 30 seconds.
         return _failure_response(
             request,
             decision="confirm_first",
@@ -242,20 +227,17 @@ async def decide(request: DecideRequest) -> DecideResponse:
             signals=signals,
             prompt=prompt,
         )
-    except anthropic.AuthenticationError as exc:
-        raise HTTPException(status_code=500, detail=f"Anthropic auth error: {exc.message}")
-    except anthropic.BadRequestError as exc:
-        raise HTTPException(status_code=400, detail=f"Bad request to Anthropic: {exc.message}")
-    except anthropic.RateLimitError as exc:
-        raise HTTPException(status_code=429, detail=f"Anthropic rate limit: {exc.message}")
-    except anthropic.APIError as exc:
-        raise HTTPException(status_code=502, detail=f"Anthropic API error: {exc.message}")
+    except openai.AuthenticationError as exc:
+        raise HTTPException(status_code=500, detail=f"xAI auth error: {exc.message}")
+    except openai.BadRequestError as exc:
+        raise HTTPException(status_code=400, detail=f"Bad request to xAI: {exc.message}")
+    except openai.RateLimitError as exc:
+        raise HTTPException(status_code=429, detail=f"xAI rate limit: {exc.message}")
+    except openai.APIError as exc:
+        raise HTTPException(status_code=502, detail=f"xAI API error: {exc.message}")
 
-    # Step 4 – extract the raw text from the response content blocks.
-    raw_output: str = next(
-        (block.text for block in message.content if block.type == "text"),
-        "",
-    )
+    # Step 4 – extract raw text.
+    raw_output: str = response.choices[0].message.content or ""
 
     # Step 5 – parse and validate the JSON response.
     try:

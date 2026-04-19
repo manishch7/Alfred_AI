@@ -33,7 +33,7 @@ compute_signals()          ← pure Python, no I/O, deterministic
 build_prompt()             ← assembles signals + history + taxonomy
   │
   ▼
-Claude (claude-sonnet-4-6) ← reasons over briefing + history, decides
+Groq (qwen/qwen3-32b)     ← reasons over briefing + history, decides
   │
   ▼
 _validate_parsed()         ← enforces schema, rejects invalid values
