@@ -75,11 +75,17 @@ What needs to change: tool-specific signal schemas, reversibility as actual infr
 
 ## What I'd build next with six months
 
-1. **Eval harness** — run all scenarios on every deploy, track decision distributions across model versions, catch regressions before they ship.
-2. **Outcome feedback loop** — user corrections and error rates feed back into the risk scoring function. A system that can't learn from mistakes will accumulate them.
-3. **Per-user risk profiles** — role, authorization level, and approval history change what `confirm_first` means for different actors.
-4. **Policy engine separate from the model** — decision thresholds should be configuration, not prompt text. Changing policy shouldn't require a prompt change and a redeploy.
-5. **Embeddings-based classifier** — replace the keyword taxonomy with a small trained classifier to eliminate the most common failure mode.
+1. **Dynamic risk scoring** — the flat base rates (email=0.45, financial=0.75) mean "send a reminder to one person" and "email the full investor list with Q3 financials" score identically. Risk needs to factor in recipient count, amount involved, content sensitivity, and time pressure in the message — not just action category.
+
+2. **Smarter conflict detection** — the current heuristic requires an override keyword ("actually", "don't", "cancel"). It misses "Ok go ahead and send it" following an uncleared legal hold because the final turn has no override word. An NLP-based hold/gate detector that tracks pending approval states across the conversation would catch this class of adversarial inputs.
+
+3. **Eval harness before anything else** — we saw during testing that the hardest scenarios (legal hold + implicit re-approval) produce borderline decisions. Without a harness that runs every scenario on every deploy and tracks decision distributions across model versions, there's no way to know if a prompt change made the system safer or less safe.
+
+4. **Outcome feedback loop** — the model self-reports 80–95% confidence regardless of whether the decision was correct. Wiring in user corrections ("undo that", "that wasn't what I meant") and actual outcome data lets the risk scoring and confidence calibration improve over time rather than staying static.
+
+5. **Policy engine separate from the model** — decision thresholds live inside the prompt today, so changing policy requires a prompt edit and a redeploy. Thresholds should be configuration that non-engineers can update. The model reasons about facts; humans declare policy. Those are different jobs and shouldn't be coupled.
+
+6. **Model-agnostic inference layer** — during development we cycled through Anthropic, xAI, and Groq as the underlying model changed. Each swap required code changes. An abstraction layer with a consistent interface would let the best available model be swapped in without touching the decision logic.
 
 ---
 
@@ -90,7 +96,7 @@ What needs to change: tool-specific signal schemas, reversibility as actual infr
 cd backend
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-ANTHROPIC_API_KEY=your_key uvicorn app.main:app --reload
+GROQ_API_KEY=your_key uvicorn app.main:app --reload
 
 # Frontend
 cd frontend
@@ -107,7 +113,7 @@ The frontend expects the backend at `http://localhost:8000`. Override with `NEXT
 Deploy backend first — you need its URL to configure the frontend.
 
 **Backend service** (root: `backend/`)
-- Add env var: `ANTHROPIC_API_KEY`
+- Add env var: `GROQ_API_KEY` (get free key at console.groq.com)
 - Confirm `GET /health` returns `{"status":"ok"}`
 
 **Frontend service** (root: `frontend/`)
