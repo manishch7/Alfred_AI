@@ -14,15 +14,24 @@ from app.scenarios import SCENARIOS
 from app.signals import compute_signals
 
 # ---------------------------------------------------------------------------
-# xAI / Grok client – OpenAI-compatible, reads XAI_API_KEY.
+# Groq client – lazy so a missing key fails at request time, not startup.
 # ---------------------------------------------------------------------------
 
-_client = openai.OpenAI(
-    api_key=os.getenv("GROQ_API_KEY"),
-    base_url="https://api.groq.com/openai/v1",
-)
-
+_client: openai.OpenAI | None = None
 _MODEL = "qwen/qwen3-32b"
+
+
+def _get_client() -> openai.OpenAI:
+    global _client
+    if _client is None:
+        api_key = os.getenv("GROQ_API_KEY")
+        if not api_key:
+            raise HTTPException(status_code=500, detail="GROQ_API_KEY is not set")
+        _client = openai.OpenAI(
+            api_key=api_key,
+            base_url="https://api.groq.com/openai/v1",
+        )
+    return _client
 
 # ---------------------------------------------------------------------------
 # Static system message.
@@ -207,7 +216,7 @@ async def decide(request: DecideRequest) -> DecideResponse:
     try:
         response = await asyncio.wait_for(
             asyncio.to_thread(
-                _client.chat.completions.create,
+                _get_client().chat.completions.create,
                 model=_MODEL,
                 max_tokens=512,
                 messages=[
